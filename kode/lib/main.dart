@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -93,29 +94,45 @@ class _HomeState extends State<Home> {
   bool busy = false;
 
   Future<void> connect() async {
+    if (busy) return;
+    final had = dsp != null; // sudah pernah terhubung: layar mixer tetap tampil
     setState(() {
       busy = true;
-      status = 'Menghubungkan...';
+      if (!had) status = 'Menghubungkan...';
     });
-    dsp?.dispose();
     final d = Dsp(ip.text.trim());
+    DspState? s;
+    String? err;
     try {
       await d.open();
-      final s = await d.readState();
-      if (!mounted) return;
-      setState(() {
-        busy = false;
-        dsp = d;
-        st = s;
-        status = s == null ? 'DSP tidak membalas. Cek IP dan pastikan satu WiFi.' : 'Terhubung';
-      });
+      s = await d.readState();
     } catch (e) {
-      if (!mounted) return;
+      err = 'Gagal: $e';
+    }
+    if (!mounted) {
+      d.dispose();
+      return;
+    }
+    if (s == null) {
+      d.dispose();
       setState(() {
         busy = false;
-        status = 'Gagal: $e';
+        if (!had) status = err ?? 'DSP tidak membalas. Cek IP dan pastikan satu WiFi.';
       });
+      if (had) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(err ?? 'Gagal menyambung ke DSP')));
+      }
+      return;
     }
+    final old = dsp;
+    setState(() {
+      busy = false;
+      dsp = d;
+      st = s;
+      status = 'Terhubung';
+    });
+    old?.dispose();
   }
 
   @override
@@ -154,23 +171,60 @@ class _HomeState extends State<Home> {
         ),
       );
     }
-    return Mixer(key: ValueKey(s.hashCode), dsp: d, st: s, onRefresh: connect);
+    return Mixer(key: ValueKey(s.hashCode), dsp: d, st: s, busy: busy, onRefresh: connect);
   }
 }
 
 // ---------------- layar utama ----------------
 class Mixer extends StatefulWidget {
-  const Mixer({super.key, required this.dsp, required this.st, required this.onRefresh});
+  const Mixer({super.key, required this.dsp, required this.st, required this.busy, required this.onRefresh});
   final Dsp dsp;
   final DspState st;
+  final bool busy;
   final VoidCallback onRefresh;
   @override
   State<Mixer> createState() => _MixerState();
 }
 
-class _MixerState extends State<Mixer> {
+class _MixerState extends State<Mixer> with WidgetsBindingObserver {
   int page = 0;
   Ch sel = const Ch.output(0);
+  late bool online = widget.dsp.online;
+  StreamSubscription<bool>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _sub = widget.dsp.onlineStream.listen((v) {
+      if (!mounted) return;
+      final back = v && !online;
+      setState(() => online = v);
+      // DSP menjawab lagi setelah terputus: baca ulang status (bisa jadi DSP restart)
+      if (back) widget.onRefresh();
+    });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) {
+      // keamanan: generator jangan dibiarkan menyala saat app di background
+      widget.dsp.genStop();
+    } else if (state == AppLifecycleState.resumed) {
+      setState(() {});
+      widget.dsp.ping().then((ok) {
+        if (!ok && mounted) widget.onRefresh();
+      });
+    }
+  }
+
   static const icons = [Icons.tune, Icons.graphic_eq, Icons.schedule, Icons.compress, Icons.call_split, Icons.waves];
   static const labels = ['Gain', 'EQ', 'Delay', 'Comp&Gate', 'Matrix', 'Generator'];
 
@@ -209,17 +263,42 @@ class _MixerState extends State<Mixer> {
                     ),
                 ]),
               ),
-              IconButton(
-                  tooltip: 'Baca ulang dari DSP',
-                  onPressed: widget.onRefresh,
-                  icon: const Icon(Icons.refresh)),
+              Tooltip(
+                message: online ? 'Terhubung' : 'Terputus',
+                child: Padding(
+                  padding: const EdgeInsets.all(6),
+                  child: Icon(Icons.circle, size: 12, color: online ? Colors.greenAccent : Colors.redAccent),
+                ),
+              ),
+              if (widget.busy)
+                const Padding(
+                  padding: EdgeInsets.all(12),
+                  child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
+                )
+              else
+                IconButton(
+                    tooltip: 'Baca ulang dari DSP',
+                    onPressed: widget.onRefresh,
+                    icon: const Icon(Icons.refresh)),
               IconButton(
                   tooltip: 'Store to device',
                   onPressed: () => storeDialog(context, d, s),
                   icon: const Icon(Icons.save_outlined)),
             ]),
           ),
-          Expanded(child: body),
+          Expanded(
+            child: Column(children: [
+              if (!online)
+                Container(
+                  width: double.infinity,
+                  color: Colors.red.shade800,
+                  padding: const EdgeInsets.symmetric(vertical: 3),
+                  child: const Text('DSP tidak terhubung, mencoba menyambung ulang...',
+                      textAlign: TextAlign.center, style: TextStyle(fontSize: 12)),
+                ),
+              Expanded(child: body),
+            ]),
+          ),
         ]),
       ),
     );
@@ -1027,8 +1106,16 @@ class _GenPageState extends State<GenPage> {
   double level = -60;
   int freq = 1000;
   int type = 0;
-  bool on = false;
   final gate = Gate();
+
+  bool get on => widget.dsp.genOn;
+
+  @override
+  void dispose() {
+    // keluar dari halaman ini (atau app ditutup) = generator dimatikan
+    widget.dsp.genStop();
+    super.dispose();
+  }
 
   Future<void> _on(bool v) async {
     if (v) {
@@ -1051,9 +1138,16 @@ class _GenPageState extends State<GenPage> {
       await widget.dsp.send(genOutputsCmd(widget.st.genOut));
     }
     if (!mounted) return;
-    setState(() => on = v);
+    setState(() => widget.dsp.genOn = v);
     final r = await widget.dsp.send(genMuteCmd(!v));
-    if (mounted) report(context, r);
+    if (!r && !v) {
+      // perintah mati belum terkonfirmasi: anggap masih menyala supaya genStop() tetap mencoba
+      widget.dsp.genOn = true;
+    }
+    if (mounted) {
+      setState(() {});
+      report(context, r);
+    }
   }
 
   @override

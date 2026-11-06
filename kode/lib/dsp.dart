@@ -193,14 +193,33 @@ class Dsp {
   RawDatagramSocket? _sock;
   Timer? _beat;
   int _seq = 0;
+  bool _closed = false;
+  bool _online = true;
+  int _offTicks = 0;
+  DateTime _lastRx = DateTime.now();
   final _rx = StreamController<Uint8List>.broadcast();
   final _meters = StreamController<List<int>>.broadcast();
+  final _onlineCtl = StreamController<bool>.broadcast();
+
+  /// Signal generator sedang menyala (diatur dari halaman Generator).
+  bool genOn = false;
 
   /// 12 nilai level: input A-D lalu output 1-8 (lantai 32, skala belum dikalibrasi).
   Stream<List<int>> get meters => _meters.stream;
 
+  /// True kalau ada paket dari DSP dalam 6 detik terakhir.
+  bool get online => _online;
+  Stream<bool> get onlineStream => _onlineCtl.stream;
+
   Future<void> open() async {
     _addr = InternetAddress(ip);
+    await _bind();
+    // software asli mengirim heartbeat tiap 2 detik
+    _beat = Timer.periodic(const Duration(seconds: 2), (_) => _tick());
+  }
+
+  Future<void> _bind() async {
+    _sock?.close();
     final s = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
     _sock = s;
     s.listen((e) {
@@ -209,22 +228,79 @@ class Dsp {
       while ((d = s.receive()) != null) {
         final p = d!;
         if (p.address.address != ip) continue;
+        _lastRx = DateTime.now();
+        if (_closed) continue;
         if (p.data.length == 73 && p.data[0] == 0xad) {
           _meters.add(p.data.sublist(8, 20));
         } else {
           _rx.add(p.data);
         }
       }
-    });
-    // software asli mengirim heartbeat tiap 2 detik
-    _beat = Timer.periodic(const Duration(seconds: 2), (_) {
-      _sock?.send(frame(_next(), [0xfa]), _addr, port);
-    });
+    }, onError: (_) {});
+  }
+
+  /// Kirim mentah, tidak pernah melempar error (jaringan bisa putus kapan saja di Android).
+  void _tx(List<int> pkt) {
+    try {
+      _sock?.send(pkt, _addr, port);
+    } catch (_) {}
+  }
+
+  void _setOnline(bool v) {
+    if (v == _online) return;
+    _online = v;
+    if (!_onlineCtl.isClosed) _onlineCtl.add(v);
+  }
+
+  void _tick() {
+    if (_closed) return;
+    _tx(frame(_next(), [0xfa]));
+    _setOnline(DateTime.now().difference(_lastRx) < const Duration(seconds: 6));
+    if (_online) {
+      _offTicks = 0;
+    } else if (++_offTicks % 3 == 0) {
+      // WiFi bisa putus/ganti jaringan: bind ulang socket tiap ~6 detik selama terputus
+      _bind().catchError((_) {});
+    }
+  }
+
+  /// Cek cepat apakah DSP masih menjawab (dipakai saat app kembali dari background).
+  Future<bool> ping() async {
+    if (_closed) return false;
+    final t0 = DateTime.now();
+    _tx(frame(_next(), [0xfa]));
+    for (var i = 0; i < 15; i++) {
+      await Future.delayed(const Duration(milliseconds: 100));
+      if (_closed) return false;
+      if (_lastRx.isAfter(t0)) {
+        _setOnline(true);
+        return true;
+      }
+    }
+    _setOnline(false);
+    return false;
+  }
+
+  /// Matikan signal generator. Aman dipanggil berkali-kali; dikirim 3x karena UDP.
+  void genStop() {
+    if (!genOn) return;
+    genOn = false;
+    final pkt = frame(_next(), genMuteCmd(true));
+    for (var i = 0; i < 3; i++) {
+      _tx(pkt);
+    }
   }
 
   void dispose() {
+    if (_closed) return;
+    genStop();
+    _closed = true;
     _beat?.cancel();
     _sock?.close();
+    _sock = null;
+    _rx.close();
+    _meters.close();
+    _onlineCtl.close();
   }
 
   int _next() {
@@ -251,12 +327,14 @@ class Dsp {
 
   /// Kirim satu perintah dan tunggu ack. False kalau DSP tidak membalas.
   Future<bool> send(List<int> data, {int retries = 3}) async {
+    if (_closed) return false;
     final s = _next();
     final pkt = frame(s, data);
     for (var i = 0; i < retries; i++) {
       final wait = _wait((p) => _isReply(p, s), const Duration(milliseconds: 500));
-      _sock?.send(pkt, _addr, port);
+      _tx(pkt);
       if (await wait != null) return true;
+      if (_closed) return false;
     }
     return false;
   }
@@ -286,10 +364,15 @@ class Dsp {
         done.complete(buf.toBytes());
       }
     });
-    _sock?.send(frame(s, [0xff, 0xf2, 0x00]), _addr, port);
+    _tx(frame(s, [0xff, 0xf2, 0x00]));
     final out = await done.future
         .timeout(const Duration(seconds: 3), onTimeout: () => null);
     await sub.cancel();
-    return out == null ? null : parseState(out);
+    if (out == null) return null;
+    try {
+      return parseState(out);
+    } on FormatException {
+      return null;
+    }
   }
 }
