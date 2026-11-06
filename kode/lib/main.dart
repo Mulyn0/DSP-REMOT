@@ -329,6 +329,14 @@ class _StripState extends State<Strip> {
         Padding(
             padding: const EdgeInsets.symmetric(vertical: 3),
             child: Text('${gain.round()} dB', style: const TextStyle(fontSize: 12))),
+        // DEBUG: nilai mentah meter (hapus setelah kalibrasi)
+        StreamBuilder<List<int>>(
+          stream: widget.dsp.meters,
+          builder: (c, s) => Text(
+            s.data == null ? '-' : '${s.data![ch.input ? ch.idx : 4 + ch.idx]}',
+            style: const TextStyle(fontSize: 10, color: Colors.amber),
+          ),
+        ),
         Expanded(
           child: Row(children: [
             Expanded(
