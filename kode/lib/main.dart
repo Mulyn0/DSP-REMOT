@@ -18,6 +18,9 @@ const filterTypes = {
 };
 const bandTypes = {0: 'PEQ', 1: 'LSEQ*', 2: 'HSEQ'};
 
+// Nilai mentah meter = dBFS + 135. Bar mulai dari -80 dBFS supaya noise input terbuka tidak tampil.
+const meterFloor = 55;
+
 int lim(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
 double limd(double v, double lo, double hi) => v < lo ? lo : (v > hi ? hi : v);
 
@@ -212,8 +215,7 @@ class _MixerState extends State<Mixer> {
                   icon: const Icon(Icons.refresh)),
               IconButton(
                   tooltip: 'Store to device',
-                  onPressed: () => ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                      content: Text('Store ke DSP belum tersedia (paketnya belum ditangkap)'))),
+                  onPressed: () => storeDialog(context, d, s),
                   icon: const Icon(Icons.save_outlined)),
             ]),
           ),
@@ -221,6 +223,61 @@ class _MixerState extends State<Mixer> {
         ]),
       ),
     );
+  }
+}
+
+// ---------------- Store to device ----------------
+Future<void> storeDialog(BuildContext context, Dsp dsp, DspState st) async {
+  var slot = 1;
+  final name = TextEditingController(text: (st.presets[slot] ?? '').trim());
+  final go = await showDialog<bool>(
+    context: context,
+    builder: (c) => StatefulBuilder(
+      builder: (c, setS) => AlertDialog(
+        title: const Text('Store to device'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Setting yang aktif sekarang disimpan ke slot preset di DSP. Isi lama slot itu akan tertimpa.',
+                style: TextStyle(color: Colors.amber)),
+            const SizedBox(height: 10),
+            DropdownButton<int>(
+              value: slot,
+              isExpanded: true,
+              items: [
+                for (var i = 0; i < 32; i++)
+                  DropdownMenuItem(value: i, child: Text('Slot $i: ${(st.presets[i] ?? '').trim()}')),
+              ],
+              onChanged: (v) {
+                if (v == null) return;
+                setS(() {
+                  slot = v;
+                  name.text = (st.presets[v] ?? '').trim();
+                });
+              },
+            ),
+            TextField(
+              controller: name,
+              maxLength: 15,
+              inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[ -~]'))],
+              decoration: const InputDecoration(labelText: 'Nama preset'),
+            ),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Batal')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Simpan')),
+        ],
+      ),
+    ),
+  );
+  final nm = name.text.trim();
+  name.dispose();
+  if (go != true || nm.isEmpty) return;
+  final ok = await dsp.send(storeCmd(slot, nm), retries: 3);
+  if (ok) st.presets[slot] = nm;
+  if (context.mounted) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(ok ? 'Tersimpan ke slot $slot ($nm)' : 'DSP tidak membalas, belum tersimpan')));
   }
 }
 
@@ -329,14 +386,6 @@ class _StripState extends State<Strip> {
         Padding(
             padding: const EdgeInsets.symmetric(vertical: 3),
             child: Text('${gain.round()} dB', style: const TextStyle(fontSize: 12))),
-        // DEBUG: nilai mentah meter (hapus setelah kalibrasi)
-        StreamBuilder<List<int>>(
-          stream: widget.dsp.meters,
-          builder: (c, s) => Text(
-            s.data == null ? '-' : '${s.data![ch.input ? ch.idx : 4 + ch.idx]}',
-            style: const TextStyle(fontSize: 10, color: Colors.amber),
-          ),
-        ),
         Expanded(
           child: Row(children: [
             Expanded(
@@ -796,7 +845,7 @@ class MeterBar extends StatelessWidget {
         stream: dsp.meters,
         builder: (context, snap) {
           final v = snap.data == null ? 32 : snap.data![index];
-          final f = limd((v - 32) / 103, 0, 1);
+          final f = limd((v - meterFloor) / (135 - meterFloor), 0, 1);
           return Container(
             width: 8,
             margin: const EdgeInsets.only(right: 4, top: 4, bottom: 4),

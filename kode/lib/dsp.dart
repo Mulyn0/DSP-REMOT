@@ -55,6 +55,12 @@ List<int> genFreqCmd(int hz) => [0xfd, 2, hz >> 8, hz & 255];
 List<int> genTypeCmd(int t) => [0xfd, 1, t];
 List<int> genOutputsCmd(List<bool> on) =>
     [0xf2, 0, 0xe1, 0xf0, 0xf1, 0xf2, 0x21, 1, 0, 7, 0xfd, 0, for (final b in on) b ? 1 : 0];
+/// Store to device: simpan setting aktif ke slot preset 0..31 beserta namanya (ASCII, maks 15 huruf).
+/// Dari capture: da 01 07 'PANDORA' = slot 1, panjang nama 7. Ack DSP agak lambat (flash).
+List<int> storeCmd(int slot, String name) {
+  final n = name.codeUnits.where((c) => c >= 32 && c < 127).take(15).toList();
+  return [0xda, slot, n.length, ...n];
+}
 List<int> hpFreqCmd(Ch c, int hz) => [4, 4, c.grp, c.idx, hz >> 8, hz & 255];
 List<int> lpFreqCmd(Ch c, int hz) => [4, 5, c.grp, c.idx, hz >> 8, hz & 255];
 
