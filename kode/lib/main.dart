@@ -285,10 +285,11 @@ class _MixerState extends State<Mixer> with WidgetsBindingObserver {
                     ),
                 ]),
               ),
-              Tooltip(
-                message: online ? 'Terhubung' : 'Terputus',
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onLongPress: () => infoDialog(context, d, s),
                 child: Padding(
-                  padding: const EdgeInsets.all(6),
+                  padding: const EdgeInsets.all(10),
                   child: Icon(Icons.circle, size: 12, color: online ? Colors.greenAccent : Colors.redAccent),
                 ),
               ),
@@ -577,43 +578,115 @@ class _StripState extends State<Strip> {
 }
 
 // ---------------- halaman Delay ----------------
-class DelayPage extends StatelessWidget {
+class DelayPage extends StatefulWidget {
   const DelayPage({super.key, required this.dsp, required this.st});
   final Dsp dsp;
   final DspState st;
+  @override
+  State<DelayPage> createState() => _DelayPageState();
+}
+
+enum _DUnit { ms, m, cm }
+
+class _DelayPageState extends State<DelayPage> {
+  _DUnit unit = _DUnit.ms;
+  // kecepatan suara 343 m/s (sekitar 20 °C): 1 ms = 0,343 m
+  static const mPerMs = 0.343;
+  // dugaan: bypass aktif = 0x7f seperti mute. Dicek dengan membaca ulang dump setelah dikirim.
+  static const _bypassOn = 0x7f;
+
+  double get _factor => switch (unit) { _DUnit.ms => 1.0, _DUnit.m => mPerMs, _DUnit.cm => mPerMs * 100 };
+  String _fmt(int ms) =>
+      unit == _DUnit.ms ? '$ms' : (ms * _factor).toStringAsFixed(unit == _DUnit.m ? 2 : 1);
+  String _other(int ms) => unit == _DUnit.ms ? '${(ms * mPerMs).toStringAsFixed(2)} m' : '$ms ms';
+
+  void _snack(String t) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+
+  Future<void> _submit(Ch c, String t) async {
+    final v = double.tryParse(t.replaceAll(',', '.'));
+    if (v == null) return;
+    final n = lim((v / _factor).round(), 0, 1000);
+    setState(() => widget.st.delay[c.key] = n);
+    final ok = await widget.dsp.send(delayCmd(c, n));
+    if (mounted) report(context, ok);
+  }
+
+  Future<void> _bypass(Ch c) async {
+    final st = widget.st;
+    final old = st.delayBypass[c.key] ?? false;
+    final on = !old;
+    setState(() => st.delayBypass[c.key] = on);
+    final ok = await widget.dsp.send(delayBypassCmd(c, on ? _bypassOn : 0));
+    if (!mounted) return;
+    if (!ok) {
+      setState(() => st.delayBypass[c.key] = old);
+      report(context, false);
+      return;
+    }
+    final fresh = await widget.dsp.readState();
+    if (!mounted) return;
+    final got = fresh?.delayBypass[c.key];
+    if (got == null) {
+      _snack('Terkirim, tapi status bypass tidak ada di dump DSP, jadi belum bisa diverifikasi.');
+    } else if (got != on) {
+      setState(() => st.delayBypass[c.key] = got);
+      _snack('DSP tidak menerima nilai bypass ini. Buka Info DSP dan kirim isinya.');
+    } else {
+      report(context, true);
+    }
+  }
+
+  Widget _card(Ch c) {
+    final ms = widget.st.delay[c.key] ?? 0;
+    final byp = widget.st.delayBypass[c.key] ?? false;
+    return Container(
+      width: 96,
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(8)),
+      child: Column(children: [
+        Container(height: 5, color: c.color),
+        const SizedBox(height: 6),
+        Text(c.short),
+        const SizedBox(height: 4),
+        NumBox(w: 72, text: _fmt(ms), onSubmit: (t) => _submit(c, t)),
+        Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Text(_other(ms), style: const TextStyle(fontSize: 10, color: Colors.white54))),
+        InkWell(
+          onTap: () => _bypass(c),
+          child: Container(
+            height: 28,
+            width: double.infinity,
+            margin: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+            decoration:
+                BoxDecoration(color: byp ? Colors.amber : Colors.black26, borderRadius: BorderRadius.circular(6)),
+            alignment: Alignment.center,
+            child: Text('Bypass*', style: TextStyle(fontSize: 11, color: byp ? Colors.black : Colors.white70)),
+          ),
+        ),
+      ]),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return ListView(padding: const EdgeInsets.all(12), children: [
-      const Text('Delay (ms)'),
+      LevelOverview(dsp: widget.dsp),
       const SizedBox(height: 8),
-      Wrap(spacing: 8, runSpacing: 8, children: [
-        for (final c in allCh)
-          Container(
-            width: 92,
-            clipBehavior: Clip.antiAlias,
-            decoration: BoxDecoration(color: panel, borderRadius: BorderRadius.circular(8)),
-            child: Column(children: [
-              Container(height: 5, color: c.color),
-              const SizedBox(height: 6),
-              Text(c.short),
-              const SizedBox(height: 4),
-              NumBox(
-                w: 70,
-                text: '${st.delay[c.key] ?? 0}',
-                onSubmit: (t) async {
-                  final v = int.tryParse(t);
-                  if (v == null) return;
-                  final n = lim(v, 0, 1000);
-                  st.delay[c.key] = n;
-                  final ok = await dsp.send(delayCmd(c, n));
-                  if (context.mounted) report(context, ok);
-                },
-              ),
-              const SizedBox(height: 8),
-            ]),
-          ),
+      Row(children: [
+        const Text('Delay  '),
+        for (final u in _DUnit.values)
+          Padding(
+              padding: const EdgeInsets.only(right: 6),
+              child: ChoiceChip(
+                  label: Text(u.name), selected: unit == u, onSelected: (_) => setState(() => unit = u))),
       ]),
+      const Padding(
+          padding: EdgeInsets.only(top: 4),
+          child: Text('Meter dan cm dihitung dari kecepatan suara 343 m/s. Langkah DSP 1 ms (sekitar 34 cm).',
+              style: TextStyle(fontSize: 11, color: Colors.white54))),
+      const SizedBox(height: 8),
+      Wrap(spacing: 8, runSpacing: 8, children: [for (final c in allCh) _card(c)]),
     ]);
   }
 }
@@ -1382,27 +1455,223 @@ class _NumBoxState extends State<NumBox> {
 }
 
 // ---------------- level meter ----------------
-class MeterBar extends StatelessWidget {
-  const MeterBar({super.key, required this.dsp, required this.index});
+class MeterBar extends StatefulWidget {
+  const MeterBar({
+    super.key,
+    required this.dsp,
+    required this.index,
+    this.vertical = true,
+    this.thickness = 8,
+    this.labels = false,
+    this.marker,
+    this.margin = const EdgeInsets.only(right: 4, top: 4, bottom: 4),
+  });
   final Dsp dsp;
   final int index;
+  final bool vertical;
+  final double thickness;
+  final bool labels;
+
+  /// garis penanda dalam nilai mentah meter (dBFS + 135), mis. threshold gate
+  final int? marker;
+  final EdgeInsets margin;
+  @override
+  State<MeterBar> createState() => _MeterBarState();
+}
+
+class _MeterBarState extends State<MeterBar> {
+  StreamSubscription<List<int>>? _sub;
+  double f = 0, peak = 0;
+  DateTime _peakAt = DateTime.now();
 
   @override
-  Widget build(BuildContext context) => StreamBuilder<List<int>>(
-        stream: dsp.meters,
-        builder: (context, snap) {
-          final v = snap.data == null ? 32 : snap.data![index];
-          final f = limd((v - meterFloor) / (135 - meterFloor), 0, 1);
-          return Container(
-            width: 8,
-            margin: const EdgeInsets.only(right: 4, top: 4, bottom: 4),
-            color: Colors.black38,
-            alignment: Alignment.bottomCenter,
-            child: FractionallySizedBox(
-                heightFactor: f, child: const ColoredBox(color: Color(0xFF6CC644), child: SizedBox.expand())),
-          );
-        },
+  void initState() {
+    super.initState();
+    _sub = widget.dsp.meters.listen((m) {
+      if (!mounted || widget.index >= m.length) return;
+      final n = limd((m[widget.index] - meterFloor) / (135 - meterFloor), 0, 1);
+      final now = DateTime.now();
+      if (n >= peak) {
+        peak = n;
+        _peakAt = now;
+      } else if (now.difference(_peakAt) > const Duration(milliseconds: 1500)) {
+        peak = math.max(n, peak - 0.03); // tahan 1,5 detik lalu turun pelan
+      }
+      setState(() => f = n);
+    });
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final w = widget;
+    final lab = w.labels ? (w.vertical ? 24.0 : 14.0) : 0.0;
+    final paint = CustomPaint(
+        painter: _MeterPainter(f, peak, w.vertical, w.labels, w.marker), child: const SizedBox.expand());
+    return Padding(
+      padding: w.margin,
+      child: w.vertical
+          ? SizedBox(width: w.thickness + lab, child: paint)
+          : SizedBox(height: w.thickness + lab, child: paint),
+    );
+  }
+}
+
+class _MeterPainter extends CustomPainter {
+  _MeterPainter(this.f, this.peak, this.vertical, this.labels, this.marker);
+  final double f, peak;
+  final bool vertical, labels;
+  final int? marker;
+  static const ticks = [-60, -40, -20, -10, -6, 0];
+
+  double _pos(num dbfs) => limd((dbfs + 80) / 80, 0, 1);
+
+  void _label(Canvas c, String s, Offset o, {bool center = false}) {
+    final tp = TextPainter(
+        text: TextSpan(text: s, style: const TextStyle(color: Colors.white54, fontSize: 9)),
+        textDirection: TextDirection.ltr)
+      ..layout();
+    tp.paint(c, center ? o - Offset(tp.width / 2, 0) : o - Offset(0, tp.height / 2));
+  }
+
+  @override
+  void paint(Canvas c, Size s) {
+    final lab = labels ? (vertical ? 24.0 : 14.0) : 0.0;
+    final bar = vertical
+        ? Rect.fromLTWH(0, 0, s.width - lab, s.height)
+        : Rect.fromLTWH(0, 0, s.width, s.height - lab);
+    c.drawRect(bar, Paint()..color = Colors.black38);
+    Rect seg(double a, double b) => vertical
+        ? Rect.fromLTRB(bar.left, bar.bottom - bar.height * b, bar.right, bar.bottom - bar.height * a)
+        : Rect.fromLTRB(bar.left + bar.width * a, bar.top, bar.left + bar.width * b, bar.bottom);
+    void fill(double a, double b, Color col) {
+      final hi = math.min(f, b);
+      if (hi > a) c.drawRect(seg(a, hi), Paint()..color = col);
+    }
+
+    void line(double p, Paint paint) {
+      final r = seg(p, p);
+      if (vertical) {
+        c.drawLine(Offset(r.left, r.top), Offset(r.right, r.top), paint);
+      } else {
+        c.drawLine(Offset(r.left, r.top), Offset(r.left, r.bottom), paint);
+      }
+    }
+
+    final y1 = _pos(-18), y2 = _pos(-6);
+    fill(0, y1, const Color(0xFF6CC644));
+    fill(y1, y2, const Color(0xFFE8C32E));
+    fill(y2, 1, const Color(0xFFE03C3C));
+    final tick = Paint()
+      ..color = Colors.white30
+      ..strokeWidth = 1;
+    for (final d in ticks) {
+      final p = _pos(d);
+      line(p, tick);
+      if (labels) {
+        if (vertical) {
+          _label(c, '$d', Offset(bar.right + 3, bar.bottom - bar.height * p));
+        } else {
+          _label(c, '$d', Offset(bar.left + bar.width * p, bar.bottom + 1), center: true);
+        }
+      }
+    }
+    if (peak > 0.01) {
+      line(
+          peak,
+          Paint()
+            ..color = Colors.white
+            ..strokeWidth = 2);
+    }
+    final m = marker;
+    if (m != null) {
+      line(
+          limd((m - meterFloor) / (135 - meterFloor), 0, 1),
+          Paint()
+            ..color = Colors.amberAccent
+            ..strokeWidth = 2.5);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter old) => true;
+}
+
+/// Deretan meter 4 input + 8 output untuk halaman yang tidak punya strip sendiri.
+class LevelOverview extends StatelessWidget {
+  const LevelOverview({super.key, required this.dsp});
+  final Dsp dsp;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+        height: 96,
+        child: Row(children: [
+          for (final c in allCh)
+            Expanded(
+              child: Column(children: [
+                Expanded(
+                    child: MeterBar(
+                        dsp: dsp,
+                        index: c.input ? c.idx : 4 + c.idx,
+                        thickness: 10,
+                        margin: const EdgeInsets.symmetric(horizontal: 6, vertical: 2))),
+                Text(c.short, style: TextStyle(fontSize: 9, color: c.color)),
+              ]),
+            ),
+        ]),
       );
+}
+
+// ---------------- Info DSP (diagnostik) ----------------
+String dumpReport(Dsp d, DspState s) {
+  String hx(List<int> b) => b.map((e) => e.toRadixString(16).padLeft(2, '0')).join(' ');
+  const known = {1, 2, 4, 5, 6, 7, 8, 0x21, 0xda};
+  final sb = StringBuffer();
+  final m = d.lastMeter;
+  sb.writeln('METER ${m?.length ?? 0} byte (indeks: isi hex)');
+  if (m != null) {
+    for (var i = 0; i < m.length; i += 16) {
+      sb.writeln('${i.toString().padLeft(2)}: ${hx(m.sublist(i, math.min(i + 16, m.length)))}');
+    }
+  }
+  sb.writeln();
+  sb.writeln('DUMP ${s.sections.length} bagian (t g panjang | isi, ? = belum dikenal)');
+  for (final r in s.sections) {
+    final n = known.contains(r[0]) ? 24 : 64;
+    sb.writeln('${known.contains(r[0]) ? "" : "? "}${r[0].toRadixString(16)} ${r[1].toRadixString(16)} '
+        '${r.length} | ${hx(r.sublist(0, math.min(r.length, n)))}${r.length > n ? " ..." : ""}');
+  }
+  return sb.toString();
+}
+
+Future<void> infoDialog(BuildContext context, Dsp dsp, DspState st) async {
+  final text = dumpReport(dsp, st);
+  await showDialog<void>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Info DSP'),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+            child: SelectableText(text, style: const TextStyle(fontFamily: 'monospace', fontSize: 10))),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: text));
+              Navigator.pop(ctx);
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Tersalin ke clipboard')));
+            },
+            child: const Text('Salin')),
+        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Tutup')),
+      ],
+    ),
+  );
 }
 
 // ---------------- Comp & Gate ----------------
@@ -1422,6 +1691,33 @@ class _CompPageState extends State<CompPage> {
     if (!end && !gate.open()) return;
     final f = widget.dsp.send(cmd, retries: end ? 3 : 1);
     if (end) f.then((ok) => report(context, ok));
+  }
+
+  void _snack(String t) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+
+  /// Saklar aktif (byte pertama). Perintah sub 1 belum terverifikasi, jadi setelah dikirim
+  /// dump dibaca ulang dan dibandingkan.
+  Future<void> _flag(bool isGate, Ch ch, List<int> arr, bool on) async {
+    final old = arr[0], v = on ? 1 : 0;
+    setState(() => arr[0] = v);
+    final ok = await widget.dsp.send(isGate ? gateCmd(ch, 1, v) : compCmd(ch, 1, v));
+    if (!mounted) return;
+    if (!ok) {
+      setState(() => arr[0] = old);
+      report(context, false);
+      return;
+    }
+    final fresh = await widget.dsp.readState();
+    if (!mounted) return;
+    final got = (isGate ? fresh?.gate[ch.key] : fresh?.comp[ch.key])?[0];
+    if (got == null) {
+      _snack('Terkirim, tapi dump tidak terbaca sehingga belum bisa diverifikasi.');
+    } else if (got != v) {
+      setState(() => arr[0] = got);
+      _snack('DSP tidak menerima perintah ini. Buka Info DSP dan kirim isinya.');
+    } else {
+      report(context, true);
+    }
   }
 
   Widget _row(String name, int raw, int lo, int hi, String text, void Function(int, bool) on) => Row(children: [
@@ -1454,6 +1750,8 @@ class _CompPageState extends State<CompPage> {
     final a = widget.st.gate.putIfAbsent(g.key, () => [1, 0, 0, 0, 0]);
     final b = widget.st.comp.putIfAbsent(c.key, () => [1, 0, 0, 0, 0, 68, 0]);
     return ListView(padding: const EdgeInsets.all(10), children: [
+      LevelOverview(dsp: widget.dsp),
+      const SizedBox(height: 8),
       _card('Noise Gate (input)', [
         Wrap(spacing: 6, children: [
           for (var i = 0; i < 4; i++)
@@ -1462,6 +1760,21 @@ class _CompPageState extends State<CompPage> {
                 selected: g.idx == i,
                 onSelected: (_) => setState(() => g = Ch.input(i))),
         ]),
+        Row(children: [
+          const Text('Aktif*'),
+          Switch(value: a[0] != 0, onChanged: (v) => _flag(true, g, a, v)),
+          const Expanded(
+              child: Text('Garis kuning = threshold, bar = level input',
+                  style: TextStyle(fontSize: 11, color: Colors.white54))),
+        ]),
+        MeterBar(
+            dsp: widget.dsp,
+            index: g.idx,
+            vertical: false,
+            thickness: 12,
+            labels: true,
+            marker: a[1],
+            margin: const EdgeInsets.symmetric(vertical: 4)),
         _row('Level', a[1], 0, 96, '${a[1] - 135} dB',
             (v, end) { setState(() => a[1] = v); _push(gateCmd(g, 2, v), end); }),
         _row('Attack', a[2], 0, 250, '${a[2] * 2} ms',
@@ -1489,6 +1802,28 @@ class _CompPageState extends State<CompPage> {
                   _push(compCmd(c, 7, i), true);
                 }),
         ]),
+        Row(children: [
+          const Text('Aktif*'),
+          Switch(value: b[0] != 0, onChanged: (v) => _flag(false, c, b, v)),
+        ]),
+        SizedBox(
+          height: 150,
+          width: double.infinity,
+          child: CustomPaint(
+              painter: CompCurvePainter(
+                  (b[1] - 135).toDouble(), 1 + b[2] * 0.04, (b[5] - 80).toDouble(), b[0] != 0),
+              child: const SizedBox.expand()),
+        ),
+        const Text('Kurva: sumbu x = level masuk, y = level keluar (dB). Level diasumsikan makeup gain.',
+            style: TextStyle(fontSize: 10, color: Colors.white54)),
+        const SizedBox(height: 4),
+        MeterBar(
+            dsp: widget.dsp,
+            index: 4 + c.idx,
+            vertical: false,
+            thickness: 12,
+            labels: true,
+            margin: const EdgeInsets.symmetric(vertical: 4)),
         _row('Threshold', b[1], 0, 155, '${b[1] - 135} dB',
             (v, end) { setState(() => b[1] = v); _push(compCmd(c, 2, v), end); }),
         _row('Ratio', b[2], 0, 100, '${(1 + b[2] * 0.04).toStringAsFixed(2)} : 1',
@@ -1502,6 +1837,71 @@ class _CompPageState extends State<CompPage> {
       ]),
     ]);
   }
+}
+
+/// Kurva transfer compressor (hard knee): di atas threshold dibagi ratio, lalu ditambah level.
+class CompCurvePainter extends CustomPainter {
+  CompCurvePainter(this.thr, this.ratio, this.makeup, this.on);
+  final double thr, ratio, makeup;
+  final bool on;
+
+  void _t(Canvas c, String s, Offset o, {bool center = false}) {
+    final tp = TextPainter(
+        text: TextSpan(text: s, style: const TextStyle(color: Colors.white54, fontSize: 9)),
+        textDirection: TextDirection.ltr)
+      ..layout();
+    tp.paint(c, center ? o - Offset(tp.width / 2, 0) : o - Offset(tp.width, tp.height / 2));
+  }
+
+  @override
+  void paint(Canvas c, Size s) {
+    final r = Rect.fromLTWH(30, 6, s.width - 38, s.height - 22);
+    double px(double d) => r.left + (limd(d, -80, 0) + 80) / 80 * r.width;
+    double py(double d) => r.bottom - (limd(d, -80, 12) + 80) / 92 * r.height;
+    c.drawRect(r, Paint()..color = const Color(0xFF0E1026));
+    final grid = Paint()
+      ..color = Colors.white12
+      ..strokeWidth = 1;
+    for (final d in [-80.0, -60.0, -40.0, -20.0, 0.0]) {
+      c.drawLine(Offset(px(d), r.top), Offset(px(d), r.bottom), grid);
+      c.drawLine(Offset(r.left, py(d)), Offset(r.right, py(d)), grid);
+      _t(c, '${d.round()}', Offset(px(d), r.bottom + 3), center: true);
+      _t(c, '${d.round()}', Offset(r.left - 3, py(d)));
+    }
+    c.drawLine(
+        Offset(px(-80), py(-80)),
+        Offset(px(0), py(0)),
+        Paint()
+          ..color = Colors.white24
+          ..strokeWidth = 1);
+    final tx = px(thr);
+    c.drawLine(
+        Offset(tx, r.top),
+        Offset(tx, r.bottom),
+        Paint()
+          ..color = Colors.amberAccent.withAlpha(150)
+          ..strokeWidth = 1);
+    final path = Path();
+    for (var i = 0; i <= 80; i++) {
+      final x = -80.0 + i;
+      final y = (x < thr ? x : thr + (x - thr) / ratio) + makeup;
+      final o = Offset(px(x), py(y));
+      if (i == 0) {
+        path.moveTo(o.dx, o.dy);
+      } else {
+        path.lineTo(o.dx, o.dy);
+      }
+    }
+    c.drawPath(
+        path,
+        Paint()
+          ..color = on ? const Color(0xFF8BE04E) : Colors.white38
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter old) => true;
 }
 
 // ---------------- Matrix ----------------
@@ -1540,6 +1940,8 @@ class _MatrixPageState extends State<MatrixPage> {
   @override
   Widget build(BuildContext context) {
     return ListView(padding: const EdgeInsets.all(10), children: [
+      LevelOverview(dsp: widget.dsp),
+      const SizedBox(height: 8),
       const Text('Matrix: ketuk kotak untuk menyambung atau memutus input ke output'),
       const SizedBox(height: 8),
       SingleChildScrollView(
@@ -1575,6 +1977,15 @@ class _GenPageState extends State<GenPage> {
   int freq = 1000;
   int type = 0;
   final gate = Gate();
+
+  @override
+  void initState() {
+    super.initState();
+    // nilai awal dari dump DSP kalau ada; kalau tidak, tetap default aman (-60 dB)
+    level = widget.st.genLevel ?? -60;
+    freq = widget.st.genFreq ?? 1000;
+    type = widget.st.genType ?? 0;
+  }
 
   bool get on => widget.dsp.genOn;
 
@@ -1622,6 +2033,8 @@ class _GenPageState extends State<GenPage> {
   Widget build(BuildContext context) {
     final out = widget.st.genOut;
     return ListView(padding: const EdgeInsets.all(12), children: [
+      LevelOverview(dsp: widget.dsp),
+      const SizedBox(height: 8),
       const Text('Signal Generator. Turunkan volume amp atau lepas speaker sebelum menyalakan.',
           style: TextStyle(color: Colors.amber)),
       const SizedBox(height: 8),

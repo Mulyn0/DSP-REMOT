@@ -104,6 +104,14 @@ class DspState {
   final comp = <String, List<int>>{};
   final eq = <String, EqCh>{};
   final presets = <int, String>{};
+  /// bypass delay per kanal (bagian dump 0xd3, bentuknya diduga mirip mute)
+  final delayBypass = <String, bool>{};
+  /// nilai generator kalau ada di dump (null = tidak ada atau tidak masuk akal)
+  double? genLevel;
+  int? genFreq;
+  int? genType;
+  /// semua bagian dump mentah, untuk layar Info DSP
+  final sections = <List<int>>[];
 }
 
 DspState parseState(Uint8List buf) {
@@ -131,6 +139,7 @@ DspState parseState(Uint8List buf) {
     final r = body.sublist(a, b);
     if (r.length < 4) continue;
     final t = r[0], g = r[1];
+    st.sections.add(r);
     if ((t == 1 || t == 2 || t == 8) && (g == 0 || g == 1)) {
       for (var i = 4; i < r.length; i++) {
         final c = g == 0 ? Ch.input(i - 4) : Ch.output(i - 4);
@@ -177,6 +186,18 @@ DspState parseState(Uint8List buf) {
         final o = 4 + ch * 7;
         if (o + 7 <= r.length) st.comp[Ch.output(ch).key] = r.sublist(o, o + 7);
       }
+    } else if (t == 0xd3 && (g == 0 || g == 1)) {
+      for (var i = 4; i < r.length && i - 4 < (g == 0 ? 4 : 8); i++) {
+        final c = g == 0 ? Ch.input(i - 4) : Ch.output(i - 4);
+        st.delayBypass[c.key] = r[i] != 0;
+      }
+    } else if (t == 1 && g == 0xfd && r.length > 4) {
+      if (r[4] <= 60) st.genLevel = r[4] - 80.0; // sama dengan rentang slider -80..-20 dB
+    } else if (t == 0xfd && g == 2 && r.length > 5) {
+      final f = (r[4] << 8) | r[5];
+      if (f >= 20 && f <= 20000) st.genFreq = f;
+    } else if (t == 0xfd && g == 1 && r.length > 4) {
+      if (r[4] <= 3) st.genType = r[4];
     } else if (t == 0xda && r.length >= 3 + r[2]) {
       st.presets[g] = String.fromCharCodes(r.sublist(3, 3 + r[2])).trim();
     }
@@ -203,6 +224,9 @@ class Dsp {
 
   /// Signal generator sedang menyala (diatur dari halaman Generator).
   bool genOn = false;
+
+  /// Paket meter 73 byte terakhir (mentah), untuk layar Info DSP.
+  Uint8List? lastMeter;
 
   /// 12 nilai level: input A-D lalu output 1-8 (lantai 32, skala belum dikalibrasi).
   Stream<List<int>> get meters => _meters.stream;
@@ -231,6 +255,7 @@ class Dsp {
         _lastRx = DateTime.now();
         if (_closed) continue;
         if (p.data.length == 73 && p.data[0] == 0xad) {
+          lastMeter = p.data;
           _meters.add(p.data.sublist(8, 20));
         } else {
           _rx.add(p.data);
