@@ -94,6 +94,7 @@ class _HomeState extends State<Home> {
   DspState? st;
   String status = 'Belum terhubung';
   bool busy = false;
+  int _gen = 0; // naik tiap connect/disconnect, untuk membatalkan koneksi yang sedang berjalan
 
   @override
   void initState() {
@@ -117,6 +118,7 @@ class _HomeState extends State<Home> {
   Future<void> connect() async {
     if (busy) return;
     final had = dsp != null; // sudah pernah terhubung: layar mixer tetap tampil
+    final my = ++_gen;
     setState(() {
       busy = true;
       if (!had) status = 'Menghubungkan...';
@@ -130,8 +132,8 @@ class _HomeState extends State<Home> {
     } catch (e) {
       err = 'Gagal: $e';
     }
-    if (!mounted) {
-      d.dispose();
+    if (!mounted || my != _gen) {
+      d.dispose(); // di-disconnect atau diganti koneksi baru selagi menunggu
       return;
     }
     if (s == null) {
@@ -155,6 +157,19 @@ class _HomeState extends State<Home> {
     });
     _saveIp(d.ip);
     old?.dispose();
+  }
+
+  /// Putuskan koneksi: generator dimatikan, socket ditutup, kembali ke layar IP.
+  void disconnect() {
+    _gen++;
+    final d = dsp;
+    setState(() {
+      dsp = null;
+      st = null;
+      busy = false;
+      status = 'Terputus. Ketuk Hubungkan untuk menyambung lagi.';
+    });
+    d?.dispose();
   }
 
   @override
@@ -193,17 +208,25 @@ class _HomeState extends State<Home> {
         ),
       );
     }
-    return Mixer(key: ValueKey(s.hashCode), dsp: d, st: s, busy: busy, onRefresh: connect);
+    return Mixer(
+        key: ValueKey(s.hashCode), dsp: d, st: s, busy: busy, onRefresh: connect, onDisconnect: disconnect);
   }
 }
 
 // ---------------- layar utama ----------------
 class Mixer extends StatefulWidget {
-  const Mixer({super.key, required this.dsp, required this.st, required this.busy, required this.onRefresh});
+  const Mixer(
+      {super.key,
+      required this.dsp,
+      required this.st,
+      required this.busy,
+      required this.onRefresh,
+      required this.onDisconnect});
   final Dsp dsp;
   final DspState st;
   final bool busy;
   final VoidCallback onRefresh;
+  final VoidCallback onDisconnect;
   @override
   State<Mixer> createState() => _MixerState();
 }
@@ -245,6 +268,23 @@ class _MixerState extends State<Mixer> with WidgetsBindingObserver {
         if (!ok && mounted) widget.onRefresh();
       });
     }
+  }
+
+  Future<void> _confirmDisconnect() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('Putuskan koneksi?'),
+        content: Text(widget.dsp.genOn
+            ? 'Signal generator sedang menyala dan akan dimatikan. Pengaturan lain di DSP tidak berubah.'
+            : 'Pengaturan di DSP tidak berubah.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Batal')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Putuskan')),
+        ],
+      ),
+    );
+    if (ok == true && mounted) widget.onDisconnect();
   }
 
   static const icons = [Icons.tune, Icons.graphic_eq, Icons.schedule, Icons.compress, Icons.call_split, Icons.waves];
@@ -307,6 +347,10 @@ class _MixerState extends State<Mixer> with WidgetsBindingObserver {
                   tooltip: 'Store to device',
                   onPressed: () => storeDialog(context, d, s),
                   icon: const Icon(Icons.save_outlined)),
+              IconButton(
+                  tooltip: 'Putuskan koneksi',
+                  onPressed: _confirmDisconnect,
+                  icon: const Icon(Icons.power_settings_new)),
             ]),
           ),
           Expanded(
