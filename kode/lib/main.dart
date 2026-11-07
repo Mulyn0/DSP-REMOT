@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'dsp.dart';
 
 const bg = Color(0xFF181B3A);
@@ -93,6 +95,25 @@ class _HomeState extends State<Home> {
   String status = 'Belum terhubung';
   bool busy = false;
 
+  @override
+  void initState() {
+    super.initState();
+    _loadIp();
+  }
+
+  Future<void> _loadIp() async {
+    try {
+      final v = (await SharedPreferences.getInstance()).getString('dsp_ip');
+      if (v != null && v.isNotEmpty && mounted && st == null) ip.text = v;
+    } catch (_) {}
+  }
+
+  Future<void> _saveIp(String v) async {
+    try {
+      await (await SharedPreferences.getInstance()).setString('dsp_ip', v);
+    } catch (_) {}
+  }
+
   Future<void> connect() async {
     if (busy) return;
     final had = dsp != null; // sudah pernah terhubung: layar mixer tetap tampil
@@ -132,6 +153,7 @@ class _HomeState extends State<Home> {
       st = s;
       status = 'Terhubung';
     });
+    _saveIp(d.ip);
     old?.dispose();
   }
 
@@ -361,13 +383,23 @@ Future<void> storeDialog(BuildContext context, Dsp dsp, DspState st) async {
 }
 
 // ---------------- halaman Gain ----------------
-class GainPage extends StatelessWidget {
+// pasangan stereo (IN A+B, IN C+D, OUT 1+2, ...). Hanya ada di app, DSP tidak tahu soal link.
+final linkedPairs = <String>{};
+String pairKey(Ch c) => '${c.input ? "in" : "out"}${c.idx ~/ 2}';
+bool isLinked(Ch c) => linkedPairs.contains(pairKey(c));
+Ch partnerOf(Ch c) => c.input ? Ch.input(c.idx ^ 1) : Ch.output(c.idx ^ 1);
+
+class GainPage extends StatefulWidget {
   const GainPage({super.key, required this.dsp, required this.st, required this.sel, required this.onSel});
   final Dsp dsp;
   final DspState st;
   final Ch sel;
   final ValueChanged<Ch> onSel;
+  @override
+  State<GainPage> createState() => _GainPageState();
+}
 
+class _GainPageState extends State<GainPage> {
   @override
   Widget build(BuildContext context) {
     return Padding(
@@ -378,10 +410,12 @@ class GainPage extends StatelessWidget {
           Strip(
               key: ValueKey(c.key),
               ch: c,
-              st: st,
-              dsp: dsp,
-              selected: c.key == sel.key,
-              onSelect: () => onSel(c)),
+              st: widget.st,
+              dsp: widget.dsp,
+              selected: c.key == widget.sel.key,
+              linked: isLinked(c),
+              onSelect: () => widget.onSel(c),
+              onChanged: () => setState(() {})),
         ]
       ]),
     );
@@ -395,42 +429,89 @@ class Strip extends StatefulWidget {
       required this.st,
       required this.dsp,
       required this.selected,
-      required this.onSelect});
+      required this.linked,
+      required this.onSelect,
+      required this.onChanged});
   final Ch ch;
   final DspState st;
   final Dsp dsp;
   final bool selected;
+  final bool linked;
   final VoidCallback onSelect;
+  /// Dipanggil setelah nilai di DspState berubah, supaya strip pasangan ikut tergambar ulang.
+  final VoidCallback onChanged;
   @override
   State<Strip> createState() => _StripState();
 }
 
 class _StripState extends State<Strip> {
-  late double gain = limd((widget.st.gain[widget.ch.key] ?? 0).toDouble(), -80, 12);
-  late bool mute = widget.st.mute[widget.ch.key] ?? false;
-  late bool pol = widget.st.pol[widget.ch.key] ?? false;
   final gate = Gate();
+
+  Ch get ch => widget.ch;
+  double get gain => limd((widget.st.gain[ch.key] ?? 0).toDouble(), -80, 12);
+  bool get mute => widget.st.mute[ch.key] ?? false;
+  bool get pol => widget.st.pol[ch.key] ?? false;
+  List<Ch> get _targets => widget.linked ? [ch, partnerOf(ch)] : [ch];
+
+  Future<bool> _sendAll(List<int> Function(Ch) cmd, {int retries = 3}) async {
+    var ok = true;
+    for (final t in _targets) {
+      ok = await widget.dsp.send(cmd(t), retries: retries) && ok;
+    }
+    return ok;
+  }
+
+  void _setGain(int n, {bool end = false}) {
+    for (final t in _targets) {
+      widget.st.gain[t.key] = n;
+    }
+    widget.onChanged();
+    if (end) {
+      _sendAll((t) => gainCmd(t, n)).then((ok) {
+        if (mounted) report(context, ok);
+      });
+    } else if (gate.open()) {
+      _sendAll((t) => gainCmd(t, n), retries: 1);
+    }
+  }
 
   Future<void> _toggle(bool isMute) async {
     final v = !(isMute ? mute : pol);
-    setState(() {
-      if (isMute) {
-        mute = v;
-        widget.st.mute[widget.ch.key] = v;
-      } else {
-        pol = v;
-        widget.st.pol[widget.ch.key] = v;
-      }
-    });
-    final ok = await widget.dsp.send(isMute ? muteCmd(widget.ch, v) : polCmd(widget.ch, v));
+    final map = isMute ? widget.st.mute : widget.st.pol;
+    for (final t in _targets) {
+      map[t.key] = v;
+    }
+    widget.onChanged();
+    final ok = await _sendAll((t) => isMute ? muteCmd(t, v) : polCmd(t, v));
+    if (mounted) report(context, ok);
+  }
+
+  /// Nyalakan link: kanal pasangan mengikuti kanal ini (gain, mute, polaritas).
+  Future<void> _toggleLink() async {
+    final k = pairKey(ch);
+    if (linkedPairs.remove(k)) {
+      widget.onChanged();
+      return;
+    }
+    linkedPairs.add(k);
+    final p = partnerOf(ch);
+    final g = widget.st.gain[ch.key] ?? 0;
+    final m = mute, po = pol;
+    widget.st.gain[p.key] = g;
+    widget.st.mute[p.key] = m;
+    widget.st.pol[p.key] = po;
+    widget.onChanged();
+    var ok = await widget.dsp.send(gainCmd(p, g));
+    ok = await widget.dsp.send(muteCmd(p, m)) && ok;
+    ok = await widget.dsp.send(polCmd(p, po)) && ok;
     if (mounted) report(context, ok);
   }
 
   Widget _tog(IconData i, bool on, Color col, VoidCallback f) => InkWell(
         onTap: f,
         child: Container(
-          height: 36,
-          margin: const EdgeInsets.fromLTRB(6, 3, 6, 3),
+          height: 34,
+          margin: const EdgeInsets.fromLTRB(6, 2, 6, 2),
           decoration: BoxDecoration(
               color: on ? col : Colors.black26, borderRadius: BorderRadius.circular(6)),
           alignment: Alignment.center,
@@ -440,7 +521,6 @@ class _StripState extends State<Strip> {
 
   @override
   Widget build(BuildContext context) {
-    final ch = widget.ch;
     return Container(
       width: 72,
       margin: const EdgeInsets.symmetric(horizontal: 3),
@@ -462,34 +542,33 @@ class _StripState extends State<Strip> {
                 style: const TextStyle(color: Colors.black, fontWeight: FontWeight.bold, fontSize: 12)),
           ),
         ),
-        Padding(
-            padding: const EdgeInsets.symmetric(vertical: 3),
-            child: Text('${gain.round()} dB', style: const TextStyle(fontSize: 12))),
+        // ketuk dua kali angka dB untuk kembali ke 0 dB
+        GestureDetector(
+          onDoubleTap: () => _setGain(0, end: true),
+          behavior: HitTestBehavior.opaque,
+          child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 8),
+              child: Text('${gain.round()} dB', style: const TextStyle(fontSize: 12))),
+        ),
         Expanded(
           child: Row(children: [
             Expanded(
               child: RotatedBox(
-            quarterTurns: 3,
-            child: Slider(
-              min: -80,
-              max: 12,
-              divisions: 92,
-              value: gain,
-              onChanged: (v) {
-                setState(() => gain = v);
-                widget.st.gain[ch.key] = v.round();
-                if (gate.open()) widget.dsp.send(gainCmd(ch, v.round()), retries: 1);
-              },
-              onChangeEnd: (v) async {
-                final ok = await widget.dsp.send(gainCmd(ch, v.round()));
-                if (mounted) report(context, ok);
-              },
-            ),
-          ),
+                quarterTurns: 3,
+                child: Slider(
+                  min: -80,
+                  max: 12,
+                  divisions: 92,
+                  value: gain,
+                  onChanged: (v) => _setGain(v.round()),
+                  onChangeEnd: (v) => _setGain(v.round(), end: true),
+                ),
+              ),
             ),
             MeterBar(dsp: widget.dsp, index: ch.input ? ch.idx : 4 + ch.idx),
           ]),
         ),
+        _tog(Icons.link, widget.linked, teal, _toggleLink),
         _tog(Icons.contrast, pol, teal, () => _toggle(false)),
         _tog(Icons.volume_off, mute, Colors.amber, () => _toggle(true)),
       ]),
@@ -589,10 +668,75 @@ double responseDb(EqCh e, double f) {
   return db + _bw(e.hpType, e.hpHz, f, true) + _bw(e.lpType, e.lpHz, f, false);
 }
 
+/// Animasi level di belakang grafik EQ.
+/// DSP hanya mengirim satu angka level per kanal (bukan FFT), jadi bentuk spektrumnya
+/// ilustrasi: kemiringan spektrum musik + respons EQ + gerakan halus, dengan tinggi
+/// total mengikuti level meter kanal yang dipilih.
+class EqAnim extends ChangeNotifier {
+  static const nBars = 48;
+  final bars = List<double>.filled(nBars, 0);
+  final peaks = List<double>.filled(nBars, 0);
+  double level = -90;
+  double _t = 0;
+  int _sig = 0;
+  List<double> curve = const [];
+  List<double> barResp = const [];
+
+  static double barFreq(int i) => 20 * math.pow(1000, (i + 0.5) / nBars).toDouble();
+
+  /// Hitung ulang kurva respons hanya kalau pengaturan EQ berubah.
+  void ensure(EqCh e) {
+    final sig = Object.hashAll([
+      identityHashCode(e), e.hpType, e.lpType, e.hpHz, e.lpHz,
+      for (final b in e.bands) ...[b.db, b.q, b.hz, b.type],
+    ]);
+    if (sig == _sig && curve.isNotEmpty) return;
+    _sig = sig;
+    curve = [for (var i = 0; i <= 240; i++) responseDb(e, 20 * math.pow(1000, i / 240).toDouble())];
+    barResp = [for (var i = 0; i < nBars; i++) responseDb(e, barFreq(i))];
+  }
+
+  void clear() {
+    bars.fillRange(0, nBars, 0);
+    peaks.fillRange(0, nBars, 0);
+    level = -90;
+    notifyListeners();
+  }
+
+  /// [raw] = nilai mentah meter (dBFS + 135), null kalau tidak ada data.
+  void step(double dt, double? raw) {
+    _t += dt;
+    final target = raw == null ? -90.0 : raw - 135;
+    final k = target > level ? 0.5 : 0.12; // naik cepat, turun pelan
+    level += (target - level) * (1 - math.pow(1 - k, dt * 60).toDouble());
+    for (var i = 0; i < nBars; i++) {
+      var h = 0.0;
+      if (level > -80) {
+        final f = barFreq(i);
+        final tilt = -4.5 * math.log(math.max(f, 40) / 80) / math.ln2;
+        final wob = 6 * math.sin(_t * (2.3 + (i % 5) * 0.41) + i * 1.7) * math.sin(_t * 0.9 + i * 0.53);
+        final resp = barResp.isEmpty ? 0.0 : limd(barResp[i], -18, 18);
+        h = limd((level + 12 + tilt + wob + resp + 75) / 75, 0, 1);
+      }
+      final kk = h > bars[i] ? 0.6 : 0.15;
+      bars[i] += (h - bars[i]) * (1 - math.pow(1 - kk, dt * 60).toDouble());
+      peaks[i] = math.max(bars[i], peaks[i] - dt * 0.35);
+    }
+    notifyListeners();
+  }
+}
+
+// kode drag: 0..n-1 = band, 100 = HP, 101 = LP
+const hpDrag = 100, lpDrag = 101;
+Offset hpHandle(Rect r, EqCh e) => Offset(fx(limd(e.hpHz.toDouble(), 20, 20000), r), r.bottom - 11);
+Offset lpHandle(Rect r, EqCh e) => Offset(fx(limd(e.lpHz.toDouble(), 20, 20000), r), r.bottom - 11);
+
 class EqPainter extends CustomPainter {
-  EqPainter(this.e, this.drag);
+  EqPainter(this.e, this.drag, this.anim, this.showAnim) : super(repaint: anim);
   final EqCh e;
   final int? drag;
+  final EqAnim anim;
+  final bool showAnim;
 
   void _text(Canvas c, String s, Offset o, {double size = 9, bool center = false}) {
     final tp = TextPainter(
@@ -602,10 +746,58 @@ class EqPainter extends CustomPainter {
     tp.paint(c, center ? o - Offset(tp.width / 2, tp.height / 2) : o);
   }
 
+  void _bars(Canvas c, Rect r) {
+    c.save();
+    c.clipRect(r);
+    final fill = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.bottomCenter,
+        end: Alignment.topCenter,
+        colors: [teal.withAlpha(40), teal.withAlpha(120), const Color(0xFFF0A030).withAlpha(170)],
+        stops: const [0, 0.6, 1],
+      ).createShader(r);
+    final pk = Paint()
+      ..color = Colors.white70
+      ..strokeWidth = 1.5;
+    const n = EqAnim.nBars;
+    final w = r.width / n;
+    for (var i = 0; i < n; i++) {
+      final x0 = r.left + w * i;
+      final h = anim.bars[i] * r.height * 0.92;
+      c.drawRRect(
+          RRect.fromRectAndCorners(Rect.fromLTWH(x0 + 1, r.bottom - h, w - 2, h),
+              topLeft: const Radius.circular(2), topRight: const Radius.circular(2)),
+          fill);
+      final py = r.bottom - anim.peaks[i] * r.height * 0.92;
+      c.drawLine(Offset(x0 + 1, py), Offset(x0 + w - 1, py), pk);
+    }
+    c.restore();
+  }
+
+  void _marker(Canvas c, Rect r, String label, Offset o, bool active, bool dragging) {
+    c.drawLine(
+        Offset(o.dx, r.top),
+        Offset(o.dx, r.bottom),
+        Paint()
+          ..color = (dragging ? teal : Colors.orangeAccent).withAlpha(active ? 170 : 60)
+          ..strokeWidth = 1.2);
+    final rr = RRect.fromRectAndRadius(
+        Rect.fromCenter(center: o, width: 26, height: 16), const Radius.circular(5));
+    c.drawRRect(rr, Paint()..color = dragging ? teal : panel);
+    c.drawRRect(
+        rr,
+        Paint()
+          ..color = Colors.orangeAccent.withAlpha(active ? 255 : 110)
+          ..style = PaintingStyle.stroke);
+    _text(c, label, o, size: 9, center: true);
+  }
+
   @override
   void paint(Canvas c, Size s) {
     final r = plotRect(s);
+    anim.ensure(e);
     c.drawRect(r, Paint()..color = const Color(0xFF0E1026));
+    if (showAnim) _bars(c, r);
     final grid = Paint()
       ..color = Colors.white12
       ..strokeWidth = 1;
@@ -621,10 +813,9 @@ class EqPainter extends CustomPainter {
       _text(c, '$db', Offset(4, y - 5));
     }
     final path = Path();
-    for (var i = 0; i <= 240; i++) {
-      final f = 20 * math.pow(1000, i / 240).toDouble();
-      final x = r.left + r.width * i / 240;
-      final y = fy(limd(responseDb(e, f), -18, 18), r);
+    for (var i = 0; i < anim.curve.length; i++) {
+      final x = r.left + r.width * i / (anim.curve.length - 1);
+      final y = fy(limd(anim.curve[i], -18, 18), r);
       i == 0 ? path.moveTo(x, y) : path.lineTo(x, y);
     }
     c.drawPath(
@@ -633,6 +824,8 @@ class EqPainter extends CustomPainter {
           ..color = const Color(0xFF8BE04E)
           ..style = PaintingStyle.stroke
           ..strokeWidth = 2);
+    _marker(c, r, 'HP', hpHandle(r, e), e.hpType != 0, drag == hpDrag);
+    _marker(c, r, 'LP', lpHandle(r, e), e.lpType != 0, drag == lpDrag);
     for (var i = 0; i < e.bands.length; i++) {
       final b = e.bands[i];
       final o = Offset(fx(limd(b.hz.toDouble(), 20, 20000), r), fy(limd(b.db, -18, 18), r));
@@ -661,28 +854,238 @@ class EqPage extends StatefulWidget {
   State<EqPage> createState() => _EqPageState();
 }
 
-class _EqPageState extends State<EqPage> {
+class _EqPageState extends State<EqPage> with SingleTickerProviderStateMixin {
   final gate = Gate();
   int? drag;
+  Offset _dt = Offset.zero;
+
+  // animasi suara
+  final anim = EqAnim();
+  late final Ticker _tk;
+  StreamSubscription<List<int>>? _ms;
+  List<int>? _meter;
+  DateTime _meterAt = DateTime.fromMillisecondsSinceEpoch(0);
+  Duration _last = Duration.zero;
+  bool animOn = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _ms = widget.dsp.meters.listen((m) {
+      _meter = m;
+      _meterAt = DateTime.now();
+    });
+    _tk = createTicker((d) {
+      final dt = limd((d - _last).inMicroseconds / 1e6, 0, 0.1);
+      _last = d;
+      final c = widget.sel;
+      final fresh = DateTime.now().difference(_meterAt) < const Duration(seconds: 1);
+      final m = _meter;
+      anim.step(dt, (fresh && m != null) ? m[c.input ? c.idx : 4 + c.idx].toDouble() : null);
+    })
+      ..start();
+  }
+
+  @override
+  void dispose() {
+    _tk.dispose();
+    _ms?.cancel();
+    anim.dispose();
+    super.dispose();
+  }
 
   EqCh? get eq => widget.st.eq[widget.sel.key];
 
+  /// Kanal yang ikut berubah: kanal terpilih + pasangan stereo kalau di-link.
+  List<Ch> get _targets {
+    final c = widget.sel, p = partnerOf(c);
+    return (isLinked(c) && widget.st.eq[p.key] != null) ? [c, p] : [c];
+  }
+
   Future<void> _send(int i, {bool force = false}) async {
-    final b = eq!.bands[i];
     if (!force && !gate.open()) return;
-    final ok = await widget.dsp.send(bandCmd(widget.sel, i, b.db, b.q, b.hz), retries: force ? 3 : 1);
+    final b = eq!.bands[i];
+    var ok = true;
+    for (final t in _targets) {
+      ok = await widget.dsp.send(bandCmd(t, i, b.db, b.q, b.hz), retries: force ? 3 : 1) && ok;
+    }
     if (force && mounted) report(context, ok);
   }
 
   void _set(int i, {double? db, double? q, int? hz, bool force = false}) {
-    final e = eq!, b = e.bands[i];
-    setState(() => e.bands[i] = Band(
-        limd(db ?? b.db, -12, 12), limd(q ?? b.q, 0.3, 15), lim(hz ?? b.hz, 20, 20000), b.type));
+    final b = eq!.bands[i];
+    final nb = Band(
+        limd(db ?? b.db, -12, 12), limd(q ?? b.q, 0.3, 15), lim(hz ?? b.hz, 20, 20000), b.type);
+    setState(() {
+      for (final t in _targets) {
+        widget.st.eq[t.key]!.bands[i] = nb;
+      }
+    });
     _send(i, force: force);
   }
 
-  Future<void> _cmd(List<int> c) async {
-    final ok = await widget.dsp.send(c);
+  void _setFilter(bool hp, int hz, {bool force = false}) {
+    final n = lim(hz, 20, 20000);
+    setState(() {
+      for (final t in _targets) {
+        final te = widget.st.eq[t.key]!;
+        if (hp) {
+          te.hpHz = n;
+        } else {
+          te.lpHz = n;
+        }
+      }
+    });
+    if (!force && !gate.open()) return;
+    _sendFilter(hp, n, force);
+  }
+
+  Future<void> _sendFilter(bool hp, int n, bool force) async {
+    var ok = true;
+    for (final t in _targets) {
+      ok = await widget.dsp.send(hp ? hpFreqCmd(t, n) : lpFreqCmd(t, n), retries: force ? 3 : 1) && ok;
+    }
+    if (force && mounted) report(context, ok);
+  }
+
+  Future<void> _cmdAll(List<int> Function(Ch) f) async {
+    var ok = true;
+    for (final t in _targets) {
+      ok = await widget.dsp.send(f(t)) && ok;
+    }
+    if (mounted) report(context, ok);
+  }
+
+  Future<bool> _confirm(String title, String msg) async {
+    final r = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(msg),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Batal')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Lanjut')),
+        ],
+      ),
+    );
+    return r == true && mounted;
+  }
+
+  /// Samakan EQ kanal [targets] dengan [src] (HP, LP, semua band) dan kirim ke DSP.
+  Future<bool> _copyTo(EqCh src, List<Ch> targets) async {
+    var ok = true;
+    for (final t in targets) {
+      final te = widget.st.eq[t.key];
+      if (te == null || identical(te, src)) continue;
+      if (!mounted) return ok;
+      final n = math.min(te.bands.length, src.bands.length);
+      setState(() {
+        te.hpType = src.hpType;
+        te.lpType = src.lpType;
+        te.hpHz = src.hpHz;
+        te.lpHz = src.lpHz;
+        for (var i = 0; i < n; i++) {
+          te.bands[i] = src.bands[i];
+        }
+      });
+      ok = await widget.dsp.send(hpTypeCmd(t, src.hpType)) && ok;
+      ok = await widget.dsp.send(hpFreqCmd(t, src.hpHz)) && ok;
+      ok = await widget.dsp.send(lpTypeCmd(t, src.lpType)) && ok;
+      ok = await widget.dsp.send(lpFreqCmd(t, src.lpHz)) && ok;
+      for (var i = 0; i < n; i++) {
+        final b = src.bands[i];
+        ok = await widget.dsp.send(bandTypeCmd(t, i, b.type)) && ok;
+        ok = await widget.dsp.send(bandCmd(t, i, b.db, b.q, b.hz)) && ok;
+      }
+    }
+    return ok;
+  }
+
+  Future<void> _copyEq() async {
+    final src = eq;
+    if (src == null) return;
+    final from = widget.sel;
+    final picked = <String>{};
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: Text('Salin EQ ${from.name} ke...'),
+          content: SizedBox(
+            width: 300,
+            child: Wrap(spacing: 6, runSpacing: 4, children: [
+              for (final x in allCh)
+                if (x.key != from.key && widget.st.eq[x.key] != null)
+                  FilterChip(
+                    label: Text(x.short),
+                    selected: picked.contains(x.key),
+                    onSelected: (v) => setD(() {
+                      if (v) {
+                        picked.add(x.key);
+                      } else {
+                        picked.remove(x.key);
+                      }
+                    }),
+                  ),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Batal')),
+            FilledButton(
+                onPressed: picked.isEmpty ? null : () => Navigator.pop(ctx, true),
+                child: const Text('Salin')),
+          ],
+        ),
+      ),
+    );
+    if (go != true || !mounted) return;
+    final targets = [for (final x in allCh) if (picked.contains(x.key)) x];
+    final ok = await _copyTo(src, targets);
+    if (mounted) report(context, ok);
+  }
+
+  Future<void> _flat() async {
+    if (eq == null) return;
+    if (!await _confirm('Flat ${widget.sel.name}?',
+        'Gain semua band diset ke 0 dB. Frekuensi, Q, dan tipe tidak berubah.')) {
+      return;
+    }
+    final tg = _targets;
+    setState(() {
+      for (final t in tg) {
+        final te = widget.st.eq[t.key]!;
+        for (var i = 0; i < te.bands.length; i++) {
+          final b = te.bands[i];
+          te.bands[i] = Band(0, b.q, b.hz, b.type);
+        }
+      }
+    });
+    var ok = true;
+    for (final t in tg) {
+      final te = widget.st.eq[t.key]!;
+      for (var i = 0; i < te.bands.length; i++) {
+        final b = te.bands[i];
+        ok = await widget.dsp.send(bandCmd(t, i, 0, b.q, b.hz)) && ok;
+      }
+    }
+    if (mounted) report(context, ok);
+  }
+
+  Future<void> _toggleLink() async {
+    final c = widget.sel, k = pairKey(c), p = partnerOf(c);
+    if (linkedPairs.remove(k)) {
+      setState(() {});
+      return;
+    }
+    final e = eq, pe = widget.st.eq[p.key];
+    if (e == null || pe == null) return;
+    if (!await _confirm('Link ${c.short} + ${p.short}?',
+        'EQ ${p.name} akan disamakan dengan ${c.name}, lalu keduanya berubah bersamaan.')) {
+      return;
+    }
+    linkedPairs.add(k);
+    setState(() {});
+    final ok = await _copyTo(e, [p]);
     if (mounted) report(context, ok);
   }
 
@@ -701,7 +1104,8 @@ class _EqPageState extends State<EqPage> {
     );
   }
 
-  int _nearest(Offset p, Size s, EqCh e) {
+  /// Titik terdekat dari sentuhan: band, atau handle HP/LP di bawah grafik.
+  int _hit(Offset p, Size s, EqCh e) {
     final r = plotRect(s);
     var best = -1;
     var bd = 30.0;
@@ -712,6 +1116,15 @@ class _EqPageState extends State<EqPage> {
         bd = d;
         best = i;
       }
+    }
+    final dh = (hpHandle(r, e) - p).distance;
+    if (dh < 26 && dh < bd) {
+      bd = dh;
+      best = hpDrag;
+    }
+    final dl = (lpHandle(r, e) - p).distance;
+    if (dl < 26 && dl < bd) {
+      best = lpDrag;
     }
     return best;
   }
@@ -738,33 +1151,62 @@ class _EqPageState extends State<EqPage> {
             const SizedBox(width: 14),
             const Text('HP '),
             _typeDrop(e.hpType, (t) {
-              setState(() => e.hpType = t);
-              _cmd(hpTypeCmd(c, t));
+              setState(() {
+                for (final x in _targets) {
+                  widget.st.eq[x.key]!.hpType = t;
+                }
+              });
+              _cmdAll((x) => hpTypeCmd(x, t));
             }),
             NumBox(
                 w: 62,
                 text: '${e.hpHz}',
                 onSubmit: (t) {
                   final v = int.tryParse(t);
-                  if (v == null) return;
-                  setState(() => e.hpHz = lim(v, 20, 20000));
-                  _cmd(hpFreqCmd(c, e.hpHz));
+                  if (v != null) _setFilter(true, v, force: true);
                 }),
             const SizedBox(width: 14),
             const Text('LP '),
             _typeDrop(e.lpType, (t) {
-              setState(() => e.lpType = t);
-              _cmd(lpTypeCmd(c, t));
+              setState(() {
+                for (final x in _targets) {
+                  widget.st.eq[x.key]!.lpType = t;
+                }
+              });
+              _cmdAll((x) => lpTypeCmd(x, t));
             }),
             NumBox(
                 w: 62,
                 text: '${e.lpHz}',
                 onSubmit: (t) {
                   final v = int.tryParse(t);
-                  if (v == null) return;
-                  setState(() => e.lpHz = lim(v, 20, 20000));
-                  _cmd(lpFreqCmd(c, e.lpHz));
+                  if (v != null) _setFilter(false, v, force: true);
                 }),
+            const SizedBox(width: 10),
+            IconButton(
+                tooltip: 'Link stereo',
+                visualDensity: VisualDensity.compact,
+                icon: Icon(Icons.link, color: isLinked(c) ? teal : Colors.white54),
+                onPressed: _toggleLink),
+            IconButton(
+                tooltip: 'Flat (semua band 0 dB)',
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.horizontal_rule),
+                onPressed: _flat),
+            IconButton(
+                tooltip: 'Salin EQ ke kanal lain',
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.copy_all),
+                onPressed: _copyEq),
+            IconButton(
+                tooltip: 'Animasi suara',
+                visualDensity: VisualDensity.compact,
+                icon: Icon(Icons.graphic_eq, color: animOn ? teal : Colors.white54),
+                onPressed: () => setState(() {
+                      animOn = !animOn;
+                      _tk.muted = !animOn;
+                      if (!animOn) anim.clear();
+                    })),
           ],
         ]),
       ),
@@ -778,7 +1220,7 @@ class _EqPageState extends State<EqPage> {
               final size = Size(box.maxWidth, box.maxHeight);
               return Listener(
                 onPointerDown: (ev) {
-                  final i = _nearest(ev.localPosition, size, e);
+                  final i = _hit(ev.localPosition, size, e);
                   if (i >= 0) setState(() => drag = i);
                 },
                 onPointerMove: (ev) {
@@ -786,17 +1228,38 @@ class _EqPageState extends State<EqPage> {
                   if (i == null) return;
                   final r = plotRect(size);
                   final hz = 20 * math.pow(1000, (ev.localPosition.dx - r.left) / r.width).toDouble();
-                  final db = 18 - (ev.localPosition.dy - r.top) / r.height * 36;
-                  _set(i, hz: hz.round(), db: db);
+                  if (i == hpDrag) {
+                    _setFilter(true, hz.round());
+                  } else if (i == lpDrag) {
+                    _setFilter(false, hz.round());
+                  } else {
+                    final db = 18 - (ev.localPosition.dy - r.top) / r.height * 36;
+                    _set(i, hz: hz.round(), db: db);
+                  }
                 },
                 onPointerUp: (_) {
                   final i = drag;
                   if (i == null) return;
                   setState(() => drag = null);
-                  _send(i, force: true);
+                  if (i == hpDrag) {
+                    _setFilter(true, e.hpHz, force: true);
+                  } else if (i == lpDrag) {
+                    _setFilter(false, e.lpHz, force: true);
+                  } else {
+                    _send(i, force: true);
+                  }
                 },
                 onPointerCancel: (_) => setState(() => drag = null),
-                child: CustomPaint(size: size, painter: EqPainter(e, drag)),
+                // ketuk dua kali sebuah band = gain band itu kembali ke 0 dB
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onDoubleTapDown: (d) => _dt = d.localPosition,
+                  onDoubleTap: () {
+                    final i = _hit(_dt, size, e);
+                    if (i >= 0 && i < hpDrag) _set(i, db: 0, force: true);
+                  },
+                  child: CustomPaint(size: size, painter: EqPainter(e, drag, anim, animOn)),
+                ),
               );
             }),
           ),
@@ -812,9 +1275,14 @@ class _EqPageState extends State<EqPage> {
   }
 
   void _setType(int i, int t) {
-    final e = eq!, b = e.bands[i];
-    setState(() => e.bands[i] = Band(b.db, b.q, b.hz, t));
-    _cmd(bandTypeCmd(widget.sel, i, t));
+    setState(() {
+      for (final x in _targets) {
+        final xe = widget.st.eq[x.key]!;
+        final b = xe.bands[i];
+        xe.bands[i] = Band(b.db, b.q, b.hz, t);
+      }
+    });
+    _cmdAll((x) => bandTypeCmd(x, i, t));
   }
 
   Widget _bandCol(int i, EqCh e) {
